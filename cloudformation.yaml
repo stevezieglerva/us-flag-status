@@ -1,0 +1,498 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'US Flag Half-Staff Status API - Cost-optimized serverless architecture'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: us-flag-status
+    Description: Name of the project for resource naming
+  
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+Resources:
+  # S3 Bucket for data storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${DataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref DataBucket
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0'
+
+  # API Lambda Function
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api-${Environment}'
+      Runtime: python3.11
+      Handler: api_handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          s3 = boto3.client('s3')
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+
+          def lambda_handler(event, context):
+              try:
+                  path = event.get('pathParameters', {})
+                  http_method = event.get('httpMethod', 'GET')
+                  
+                  if event.get('path') == '/api/v1/status/current':
+                      return get_current_status()
+                  elif event.get('path') == '/api/v1/proclamations':
+                      return get_proclamations()
+                  elif event.get('path', '').startswith('/api/v1/proclamations/'):
+                      proclamation_id = path.get('id')
+                      return get_proclamation(proclamation_id)
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'Not found'})
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def get_current_status():
+              try:
+                  response = s3.get_object(Bucket=BUCKET_NAME, Key='current.json')
+                  data = json.loads(response['Body'].read())
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps(data)
+                  }
+              except s3.exceptions.NoSuchKey:
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'status': 'full_staff',
+                          'reason': 'No active proclamations',
+                          'proclamation_url': None,
+                          'last_updated': datetime.utcnow().isoformat() + 'Z'
+                      })
+                  }
+
+          def get_proclamations():
+              try:
+                  response = s3.get_object(Bucket=BUCKET_NAME, Key='index.json')
+                  data = json.loads(response['Body'].read())
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps(data)
+                  }
+              except s3.exceptions.NoSuchKey:
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'active_proclamations': [],
+                          'recent_proclamations': [],
+                          'last_updated': datetime.utcnow().isoformat() + 'Z'
+                      })
+                  }
+
+          def get_proclamation(proclamation_id):
+              if not proclamation_id:
+                  return {
+                      'statusCode': 400,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Proclamation ID required'})
+                  }
+              
+              try:
+                  # Find proclamation file by searching year directories
+                  paginator = s3.get_paginator('list_objects_v2')
+                  for page in paginator.paginate(Bucket=BUCKET_NAME, Prefix='proclamations/'):
+                      for obj in page.get('Contents', []):
+                          if proclamation_id in obj['Key']:
+                              response = s3.get_object(Bucket=BUCKET_NAME, Key=obj['Key'])
+                              data = json.loads(response['Body'].read())
+                              return {
+                                  'statusCode': 200,
+                                  'headers': {'Content-Type': 'application/json'},
+                                  'body': json.dumps(data)
+                              }
+                  
+                  return {
+                      'statusCode': 404,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Proclamation not found'})
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # Scraper Lambda Function
+  ScraperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-scraper-${Environment}'
+      Runtime: python3.11
+      Handler: scraper_handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          s3 = boto3.client('s3')
+          bedrock = boto3.client('bedrock-runtime')
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+
+          def lambda_handler(event, context):
+              try:
+                  # Use Bedrock to search for flag proclamations
+                  search_prompt = """
+                  Search for recent US presidential proclamations about flag half-staff status from whitehouse.gov.
+                  Look for any current or recent orders to lower flags to half-staff.
+                  
+                  Return a JSON response with this exact structure:
+                  {
+                    "status": "half_staff" or "full_staff",
+                    "reason": "brief description of why",
+                    "trigger_type": "death|memorial_day|tragedy|state_funeral",
+                    "person_honored": {
+                      "name": "Full Name",
+                      "title": "Official Title",
+                      "birth_date": "YYYY-MM-DD or null",
+                      "death_date": "YYYY-MM-DD or null"
+                    } or null,
+                    "event_details": {
+                      "event_name": "Event Name",
+                      "event_date": "YYYY-MM-DD",
+                      "description": "Description"
+                    } or null,
+                    "start_date": "YYYY-MM-DD",
+                    "end_date": "YYYY-MM-DD",
+                    "duration_days": number,
+                    "proclamation_id": "unique-id",
+                    "proclamation_url": "https://whitehouse.gov/..."
+                  }
+                  
+                  If no active half-staff proclamations, return status as "full_staff".
+                  """
+
+                  response = bedrock.invoke_model(
+                      modelId='anthropic.claude-3-sonnet-20240229-v1:0',
+                      body=json.dumps({
+                          "anthropic_version": "bedrock-2023-05-31",
+                          "max_tokens": 4000,
+                          "messages": [{"role": "user", "content": search_prompt}],
+                          "tools": [{
+                              "name": "web_search",
+                              "description": "Search the web for information",
+                              "input_schema": {
+                                  "type": "object",
+                                  "properties": {
+                                      "query": {"type": "string", "description": "Search query"}
+                                  },
+                                  "required": ["query"]
+                              }
+                          }]
+                      })
+                  )
+                  
+                  result = json.loads(response['body'].read())
+                  
+                  # Extract the flag status data from Bedrock response
+                  flag_data = extract_flag_data(result)
+                  
+                  # Update S3 files
+                  update_current_status(flag_data)
+                  update_index(flag_data)
+                  
+                  if flag_data.get('status') == 'half_staff':
+                      save_proclamation(flag_data)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Successfully updated flag status', 'status': flag_data.get('status')})
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def extract_flag_data(bedrock_response):
+              # Parse Bedrock response and extract structured flag data
+              # This is a simplified version - would need more robust parsing
+              content = bedrock_response.get('content', [{}])[0].get('text', '{}')
+              try:
+                  data = json.loads(content)
+                  data['last_updated'] = datetime.utcnow().isoformat() + 'Z'
+                  return data
+              except json.JSONDecodeError:
+                  # Fallback to default status
+                  return {
+                      'status': 'full_staff',
+                      'reason': 'No active proclamations found',
+                      'last_updated': datetime.utcnow().isoformat() + 'Z'
+                  }
+
+          def update_current_status(flag_data):
+              s3.put_object(
+                  Bucket=BUCKET_NAME,
+                  Key='current.json',
+                  Body=json.dumps(flag_data, indent=2),
+                  ContentType='application/json'
+              )
+
+          def update_index(flag_data):
+              index_data = {
+                  'active_proclamations': [flag_data.get('proclamation_id')] if flag_data.get('status') == 'half_staff' else [],
+                  'recent_proclamations': [flag_data.get('proclamation_id')] if flag_data.get('proclamation_id') else [],
+                  'last_updated': flag_data.get('last_updated')
+              }
+              
+              s3.put_object(
+                  Bucket=BUCKET_NAME,
+                  Key='index.json',
+                  Body=json.dumps(index_data, indent=2),
+                  ContentType='application/json'
+              )
+
+          def save_proclamation(flag_data):
+              if not flag_data.get('proclamation_id'):
+                  return
+                  
+              year = datetime.now().year
+              key = f"proclamations/{year}/{flag_data['proclamation_id']}.json"
+              
+              s3.put_object(
+                  Bucket=BUCKET_NAME,
+                  Key=key,
+                  Body=json.dumps(flag_data, indent=2),
+                  ContentType='application/json'
+              )
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: US Flag Half-Staff Status API
+      EndpointConfiguration:
+        Types:
+          - EDGE
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CurrentStatusMethod
+      - ProclamationsMethod
+      - ProclamationByIdMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+
+  # API Resources
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: api
+
+  V1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ApiResource
+      PathPart: v1
+
+  StatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref V1Resource
+      PathPart: status
+
+  CurrentStatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref StatusResource
+      PathPart: current
+
+  ProclamationsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref V1Resource
+      PathPart: proclamations
+
+  ProclamationByIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ProclamationsResource
+      PathPart: '{id}'
+
+  # API Methods
+  CurrentStatusMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref CurrentStatusResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations'
+
+  ProclamationsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ProclamationsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations'
+
+  ProclamationByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ProclamationByIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations'
+
+  # Lambda Permissions for API Gateway
+  ApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  # EventBridge Rule for daily scraping
+  DailyScrapingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-scraping-${Environment}'
+      Description: Trigger flag status scraping daily
+      ScheduleExpression: 'cron(0 12 * * ? *)'  # Daily at 12:00 UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ScraperFunction.Arn
+          Id: ScraperTarget
+
+  # Permission for EventBridge to invoke Lambda
+  ScrapingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScraperFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyScrapingRule.Arn
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-api-url-${Environment}'
+
+  BucketName:
+    Description: S3 bucket name for data storage
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${ProjectName}-bucket-${Environment}'
+
+  ApiEndpoints:
+    Description: Available API endpoints
+    Value: !Sub |
+      Current Status: https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/api/v1/status/current
+      All Proclamations: https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/api/v1/proclamations
+      Specific Proclamation: https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/api/v1/proclamations/{id}
